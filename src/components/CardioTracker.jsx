@@ -343,6 +343,51 @@ function normalizeHealthRows(rows, heartRateRows = rows) {
 }
 
 
+function normalizeSyncedHealthRows(rows = []) {
+  return rows.map((row) => {
+    const samples = Array.isArray(row.hr_samples) ? row.hr_samples : [];
+    const zones = row.hr_zones && typeof row.hr_zones === "object" ? row.hr_zones : {};
+    const sampleCount = samples.length;
+    const workout = {
+      id: row.external_id || row.id || `${row.workout_date}-${row.workout_type || "workout"}`,
+      date: row.workout_date || dateFromDateTime(row.start_time),
+      startTime: row.start_time || "",
+      endTime: row.end_time || "",
+      type: mapWorkoutType(row.workout_type),
+      sourceType: row.workout_type || "Apple Health workout",
+      duration: row.duration_minutes || "",
+      distance: row.distance || "",
+      calories: row.calories || "",
+      avgHr: row.avg_hr || "",
+      intensity: inferIntensity(row.avg_hr, row.calories, row.duration_minutes),
+      heartRateSamples: samples,
+      hrSummary: {
+        avgHr: row.avg_hr || "",
+        minHr: row.min_hr || "",
+        maxHr: row.max_hr || "",
+        sampleCount,
+        zones
+      }
+    };
+
+    return {
+      date: workout.date,
+      workout,
+      entry: {
+        completed: true,
+        type: workout.type,
+        intensity: workout.intensity,
+        duration: workout.duration ? String(workout.duration) : "",
+        distance: workout.distance ? String(workout.distance) : "",
+        calories: workout.calories ? String(workout.calories) : "",
+        avgHr: workout.avgHr ? String(workout.avgHr) : "",
+        notes: workout.sourceType ? `Synced from Apple Health: ${workout.sourceType}` : "Synced from Apple Health",
+        healthWorkouts: [workout]
+      }
+    };
+  }).filter((item) => item.date);
+}
+
 function mergeImportedCardio(existingLog, importedEntries) {
   const nextLog = { ...(existingLog ?? {}) };
   let created = 0;
@@ -406,6 +451,8 @@ function summarizeEntries(entries) {
 export default function CardioTracker({ state, activeDate, updateNested, updateState }) {
   const [selectedDate, setSelectedDate] = useState(activeDate || dateKey(new Date()));
   const [importSummary, setImportSummary] = useState("");
+  const [syncSummary, setSyncSummary] = useState("");
+  const [syncingHealth, setSyncingHealth] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -456,6 +503,67 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
 
   function updateGoal(key, value) {
     updateState({ cardioGoals: { ...goals, [key]: value } });
+  }
+
+
+  async function syncAppleHealth() {
+    let secret = localStorage.getItem("health_sync_secret") || "";
+    if (!secret) {
+      secret = window.prompt("Enter your Apple Health sync secret. This is the same value you saved in Vercel as HEALTH_IMPORT_SECRET.");
+      if (!secret) return;
+      localStorage.setItem("health_sync_secret", secret);
+    }
+
+    setSyncingHealth(true);
+    setSyncSummary("Syncing Apple Health data...");
+    try {
+      const response = await fetch("/api/health-sync", {
+        headers: { "x-health-secret": secret }
+      });
+
+      if (response.status === 401 || response.status === 403) {
+        localStorage.removeItem("health_sync_secret");
+        throw new Error("Sync secret was rejected. Re-enter the same secret saved in Vercel as HEALTH_IMPORT_SECRET.");
+      }
+
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error || "Apple Health sync failed.");
+
+      const importedEntries = normalizeSyncedHealthRows(payload.workouts ?? []);
+      if (!importedEntries.length) {
+        setSyncSummary("No synced Apple Health workouts were found yet. Send a test export from Health Auto Export first.");
+        return;
+      }
+
+      const { nextLog, created, merged, hrMapped } = mergeImportedCardio(cardioLog, importedEntries);
+      updateState({
+        cardioLog: nextLog,
+        cardioImportHistory: [
+          ...(state.cardioImportHistory ?? []).slice(-9),
+          {
+            importedAt: new Date().toISOString(),
+            fileName: "Supabase sync",
+            rows: importedEntries.length,
+            dates: new Set(importedEntries.map((item) => item.date)).size,
+            created,
+            merged,
+            hrMapped
+          }
+        ]
+      });
+      setSyncSummary(`Synced ${importedEntries.length} Apple Health workout${importedEntries.length === 1 ? "" : "s"}. Created ${created}; merged ${merged}; mapped HR samples to ${hrMapped}.`);
+    } catch (error) {
+      console.error(error);
+      setSyncSummary(error.message || "Apple Health sync failed.");
+      alert(error.message || "Apple Health sync failed.");
+    } finally {
+      setSyncingHealth(false);
+    }
+  }
+
+  function forgetHealthSyncSecret() {
+    localStorage.removeItem("health_sync_secret");
+    setSyncSummary("Saved sync secret cleared from this browser.");
   }
 
   function handleHealthImport(event) {
@@ -545,8 +653,11 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
                 Export workout data from Health Auto Export as CSV or JSON, then import it here. The importer looks for workout start/end times and timestamped heart-rate samples, so it can attach HR data to the specific workout window when those fields are present.
               </p>
               {importSummary && <p className="mt-2 rounded-xl bg-sky-50 px-3 py-2 text-xs text-sky-800">{importSummary}</p>}
+              {syncSummary && <p className="mt-2 rounded-xl bg-emerald-50 px-3 py-2 text-xs text-emerald-800">{syncSummary}</p>}
             </div>
             <div className="flex flex-wrap gap-2">
+              <Button onClick={syncAppleHealth} disabled={syncingHealth}>{syncingHealth ? "Syncing..." : "Sync Apple Health"}</Button>
+              <Button variant="outline" onClick={forgetHealthSyncSecret}>Forget Sync Secret</Button>
               <Button variant="outline" onClick={() => fileInputRef.current?.click()}>Import Apple Health CSV/JSON</Button>
               <input ref={fileInputRef} type="file" accept=".csv,.json,text/csv,application/json" onChange={handleHealthImport} className="hidden" />
             </div>
