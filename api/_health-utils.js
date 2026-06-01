@@ -301,4 +301,4 @@ async function supabaseRequest(path, options = {}) {
   return data;
 }
 
-module.exports = { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, supabaseRequest };
+export { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, supabaseRequest };

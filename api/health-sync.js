@@ -1,6 +1,6 @@
-const { cors, verifySecret, userKey, supabaseRequest } = require("./_health-utils");
+import { cors, verifySecret, userKey, supabaseRequest } from "./_health-utils.js";
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   cors(res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET") return res.status(405).json({ error: "Use GET." });
@@ -14,7 +14,7 @@ module.exports = async function handler(req, res) {
     const data = await supabaseRequest(`/rest/v1/health_workouts?user_key=eq.${key}&order=start_time.desc&limit=1000`, { method: "GET" });
     return res.status(200).json({ ok: true, workouts: data || [] });
   } catch (error) {
-    console.error(error);
+    console.error("health-sync failed", error);
     return res.status(500).json({ error: error.message || "Health sync failed." });
   }
-};
+}
