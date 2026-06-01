@@ -16,7 +16,7 @@ const HR_FIELDS = ["averageheartrate", "average heart rate", "avgheartrate", "av
 const START_FIELDS = ["startdate", "start date", "starttime", "start time", "start", "workoutstartdate", "workout start date"];
 const END_FIELDS = ["enddate", "end date", "endtime", "end time", "end", "workoutenddate", "workout end date"];
 const SAMPLE_TIME_FIELDS = ["time", "timestamp", "date", "datetime", "startdate", "start date", "creationdate", "creation date"];
-const SAMPLE_VALUE_FIELDS = ["value", "bpm", "heartrate", "heart rate", "heart rate bpm", "heart_rate", "qty", "quantity"];
+const SAMPLE_VALUE_FIELDS = ["value", "bpm", "heartrate", "heart rate", "heart rate bpm", "heart_rate", "qty", "quantity", "avg", "average", "Avg", "Average"];
 const RECORD_TYPE_FIELDS = ["recordtype", "record type", "type", "sampletype", "sample type", "identifier", "name"];
 
 function cors(res) {
@@ -254,11 +254,48 @@ async function readRequestBody(req) {
   });
 }
 
+function flattenHealthExportRows(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+
+  const rows = [];
+  const pushRows = (value, extra = {}) => {
+    if (Array.isArray(value)) {
+      value.forEach((item) => rows.push({ ...extra, ...(item ?? {}) }));
+    }
+  };
+
+  pushRows(parsed?.workouts);
+  pushRows(parsed?.data?.workouts);
+  pushRows(parsed?.records);
+  pushRows(parsed?.samples);
+  pushRows(parsed?.heartRate, { name: "heart_rate" });
+  pushRows(parsed?.heartRates, { name: "heart_rate" });
+  pushRows(parsed?.heart_rate, { name: "heart_rate" });
+  pushRows(parsed?.heartRateSamples, { name: "heart_rate" });
+  pushRows(parsed?.data?.heartRate, { name: "heart_rate" });
+  pushRows(parsed?.data?.records);
+  pushRows(parsed?.data?.samples);
+
+  const metrics = parsed?.data?.metrics ?? parsed?.metrics;
+  if (Array.isArray(metrics)) {
+    metrics.forEach((metric) => {
+      const metricName = metric?.name ?? metric?.type ?? metric?.identifier ?? "";
+      pushRows(metric?.data, { name: metricName, recordType: metricName, units: metric?.units });
+      pushRows(metric?.samples, { name: metricName, recordType: metricName, units: metric?.units });
+      pushRows(metric?.records, { name: metricName, recordType: metricName, units: metric?.units });
+    });
+  }
+
+  if (!rows.length && parsed?.data && Array.isArray(parsed.data)) return parsed.data;
+  return rows;
+}
+
 function extractHealthData(parsed) {
+  const flattened = flattenHealthExportRows(parsed);
   if (Array.isArray(parsed)) return { workouts: parsed, heartRateRows: parsed };
   return {
-    workouts: parsed?.workouts ?? parsed?.data?.workouts ?? parsed?.records ?? parsed?.data ?? parsed?.samples ?? [],
-    heartRateRows: parsed?.heartRate ?? parsed?.heartRates ?? parsed?.heart_rate ?? parsed?.heartRateSamples ?? parsed?.data?.heartRate ?? parsed?.records ?? parsed?.samples ?? parsed?.data ?? []
+    workouts: parsed?.workouts ?? parsed?.data?.workouts ?? parsed?.records ?? parsed?.samples ?? flattened ?? [],
+    heartRateRows: flattened ?? []
   };
 }
 
@@ -294,6 +331,52 @@ function normalizePayloadToRows(contentType, text) {
   });
 }
 
+function normalizePayloadToHeartRateSamples(contentType, text) {
+  let rows = [];
+  if (contentType.includes("json")) {
+    const parsed = JSON.parse(text || "{}");
+    rows = flattenHealthExportRows(parsed);
+  } else {
+    rows = parseCsv(text || "");
+  }
+  return normalizeHeartRateSamples(rows);
+}
+
+function mergeHeartRateSamples(existing = [], incoming = []) {
+  const map = new Map();
+  [...(existing ?? []), ...(incoming ?? [])].forEach((sample) => {
+    const timestamp = Number(sample?.timestamp ?? (sample?.time ? new Date(sample.time).getTime() : NaN));
+    const bpm = toNumber(sample?.bpm);
+    if (!Number.isFinite(timestamp) || !bpm) return;
+    map.set(`${timestamp}-${bpm}`, {
+      timestamp,
+      time: sample.time || new Date(timestamp).toISOString(),
+      bpm
+    });
+  });
+  return Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp);
+}
+
+function buildHeartRateUpdateForWorkout(workout, samples) {
+  const start = workout.start_time ? new Date(workout.start_time).getTime() : null;
+  const end = workout.end_time ? new Date(workout.end_time).getTime() : null;
+  if (!start || !end || end <= start) return null;
+
+  const matched = samples.filter((sample) => sample.timestamp >= start && sample.timestamp <= end);
+  if (!matched.length) return null;
+
+  const mergedSamples = mergeHeartRateSamples(workout.hr_samples ?? [], matched);
+  const stats = calculateHrStats(mergedSamples, workout.duration_minutes || ((end - start) / 60000));
+
+  return {
+    avg_hr: stats.avgHr ?? workout.avg_hr ?? null,
+    min_hr: stats.minHr ?? workout.min_hr ?? null,
+    max_hr: stats.maxHr ?? workout.max_hr ?? null,
+    hr_samples: mergedSamples,
+    hr_zones: stats.zones ?? workout.hr_zones ?? {}
+  };
+}
+
 async function supabaseRequest(path, options = {}) {
   const url = `${process.env.SUPABASE_URL}${path}`;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -316,4 +399,4 @@ async function supabaseRequest(path, options = {}) {
   return data;
 }
 
-export { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, supabaseRequest };
+export { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, buildHeartRateUpdateForWorkout, supabaseRequest };
