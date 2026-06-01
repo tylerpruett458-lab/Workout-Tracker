@@ -388,6 +388,55 @@ function normalizeSyncedHealthRows(rows = []) {
   }).filter((item) => item.date);
 }
 
+
+function formatDateTimeLocal(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function dateTimeLocalToIso(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+function recalculateEntryFromHealthWorkouts(baseEntry, workouts) {
+  const valid = (workouts ?? []).filter(Boolean);
+  if (!valid.length) {
+    return {
+      ...baseEntry,
+      completed: false,
+      duration: "",
+      distance: "",
+      calories: "",
+      avgHr: "",
+      healthWorkouts: []
+    };
+  }
+
+  const totalDuration = valid.reduce((sum, workout) => sum + toNumber(workout.duration), 0);
+  const totalDistance = valid.reduce((sum, workout) => sum + toNumber(workout.distance), 0);
+  const totalCalories = valid.reduce((sum, workout) => sum + toNumber(workout.calories), 0);
+  const hrWeightedTotal = valid.reduce((sum, workout) => sum + (toNumber(workout.avgHr) * (toNumber(workout.duration) || 1)), 0);
+  const hrWeight = valid.reduce((sum, workout) => sum + (toNumber(workout.avgHr) ? (toNumber(workout.duration) || 1) : 0), 0);
+  const avgHr = hrWeight ? roundOne(hrWeightedTotal / hrWeight) : "";
+
+  return {
+    ...baseEntry,
+    completed: true,
+    type: valid.length === 1 ? (valid[0].type ?? baseEntry.type) : (baseEntry.type ?? "Other"),
+    intensity: valid.length === 1 ? (valid[0].intensity ?? baseEntry.intensity) : (baseEntry.intensity ?? inferIntensity(avgHr, totalCalories, totalDuration)),
+    duration: totalDuration ? String(roundOne(totalDuration)) : "",
+    distance: totalDistance ? String(roundOne(totalDistance)) : "",
+    calories: totalCalories ? String(roundOne(totalCalories)) : "",
+    avgHr: avgHr ? String(avgHr) : "",
+    healthWorkouts: valid
+  };
+}
+
 function mergeImportedCardio(existingLog, importedEntries) {
   const nextLog = { ...(existingLog ?? {}) };
   let created = 0;
@@ -453,6 +502,7 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
   const [importSummary, setImportSummary] = useState("");
   const [syncSummary, setSyncSummary] = useState("");
   const [syncingHealth, setSyncingHealth] = useState(false);
+  const [selectedHealthWorkoutId, setSelectedHealthWorkoutId] = useState("");
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -471,6 +521,23 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
     intensity: "Easy",
     notes: ""
   };
+
+  const healthWorkouts = entry.healthWorkouts ?? [];
+  const selectedHealthWorkout = healthWorkouts.find((workout) => String(workout.id) === String(selectedHealthWorkoutId)) ?? healthWorkouts[0] ?? null;
+  const selectedHealthWorkoutIndex = selectedHealthWorkout
+    ? healthWorkouts.findIndex((workout) => String(workout.id) === String(selectedHealthWorkout.id))
+    : -1;
+
+  useEffect(() => {
+    const workouts = cardioLog[selectedDate]?.healthWorkouts ?? [];
+    if (!workouts.length) {
+      setSelectedHealthWorkoutId("");
+      return;
+    }
+    if (!workouts.some((workout) => String(workout.id) === String(selectedHealthWorkoutId))) {
+      setSelectedHealthWorkoutId(String(workouts[0].id));
+    }
+  }, [selectedDate, cardioLog, selectedHealthWorkoutId]);
 
   const selectedWeekStart = startOfWeek(selectedDate);
   const selectedWeekDates = Array.from({ length: 7 }, (_, index) => dateKey(addDaysToDate(selectedWeekStart, index)));
@@ -494,6 +561,33 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
 
   function updateCardioEntry(patch) {
     updateNested("cardioLog", selectedDate, { ...entry, ...patch });
+  }
+
+  function updateSelectedHealthWorkout(patch) {
+    if (selectedHealthWorkoutIndex < 0) return;
+    const nextWorkouts = healthWorkouts.map((workout, index) => {
+      if (index !== selectedHealthWorkoutIndex) return workout;
+      const nextWorkout = { ...workout, ...patch };
+      if (patch.startTime || patch.endTime) {
+        const start = nextWorkout.startTime ? new Date(nextWorkout.startTime).getTime() : null;
+        const end = nextWorkout.endTime ? new Date(nextWorkout.endTime).getTime() : null;
+        if (start && end && end > start) nextWorkout.duration = roundOne((end - start) / 60000);
+      }
+      return nextWorkout;
+    });
+    updateNested("cardioLog", selectedDate, recalculateEntryFromHealthWorkouts(entry, nextWorkouts));
+  }
+
+  function deleteSelectedHealthWorkout() {
+    if (selectedHealthWorkoutIndex < 0) return;
+    if (!window.confirm("Remove this imported workout from the selected cardio day?")) return;
+    const nextWorkouts = healthWorkouts.filter((_, index) => index !== selectedHealthWorkoutIndex);
+    if (!nextWorkouts.length) {
+      updateNested("cardioLog", selectedDate, undefined);
+      return;
+    }
+    updateNested("cardioLog", selectedDate, recalculateEntryFromHealthWorkouts(entry, nextWorkouts));
+    setSelectedHealthWorkoutId(String(nextWorkouts[0]?.id ?? ""));
   }
 
   function clearEntry() {
@@ -711,6 +805,71 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
           </div>
 
           <textarea value={entry.notes ?? ""} onChange={(e) => updateCardioEntry({ notes: e.target.value })} placeholder="Cardio notes: pace, incline, machine, recovery, breathing, etc." className="mt-3 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" rows={2} />
+
+          {!!healthWorkouts.length && (
+            <div className="mt-4 rounded-2xl border border-emerald-100 bg-emerald-50 p-3">
+              <div className="text-sm font-semibold text-emerald-900">Edit imported cardio workout</div>
+              <p className="mt-1 text-xs text-emerald-800">
+                Select a specific synced/imported workout from this date, then adjust the details. The daily cardio totals above recalculate automatically.
+              </p>
+              <div className="mt-3 grid gap-3 md:grid-cols-[2fr_1fr_auto]">
+                <label className="text-sm font-medium text-zinc-700">
+                  Imported workout
+                  <select value={selectedHealthWorkout ? String(selectedHealthWorkout.id) : ""} onChange={(e) => setSelectedHealthWorkoutId(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm">
+                    {healthWorkouts.map((workout, index) => (
+                      <option key={workout.id ?? index} value={String(workout.id)}>
+                        {workout.sourceType || workout.type || "Workout"} · {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : `#${index + 1}`} · {workout.duration || "—"} min
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="rounded-xl bg-white px-3 py-2 text-xs text-zinc-600">
+                  <div className="font-semibold text-zinc-800">Daily total</div>
+                  {entry.duration || "0"} min · {entry.calories || "0"} cal · Avg HR {entry.avgHr || "—"}
+                </div>
+                <Button variant="outline" onClick={deleteSelectedHealthWorkout} className="md:mt-5">Remove workout</Button>
+              </div>
+
+              {selectedHealthWorkout && (
+                <div className="mt-3 grid gap-3 md:grid-cols-4">
+                  <label className="text-sm font-medium text-zinc-700">
+                    Type
+                    <select value={selectedHealthWorkout.type ?? "Other"} onChange={(e) => updateSelectedHealthWorkout({ type: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm">
+                      {CARDIO_TYPES.map((type) => <option key={type}>{type}</option>)}
+                    </select>
+                  </label>
+                  <label className="text-sm font-medium text-zinc-700">
+                    Source label
+                    <input value={selectedHealthWorkout.sourceType ?? ""} onChange={(e) => updateSelectedHealthWorkout({ sourceType: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                  </label>
+                  <label className="text-sm font-medium text-zinc-700">
+                    Start time
+                    <input type="datetime-local" value={formatDateTimeLocal(selectedHealthWorkout.startTime)} onChange={(e) => updateSelectedHealthWorkout({ startTime: dateTimeLocalToIso(e.target.value) })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                  </label>
+                  <label className="text-sm font-medium text-zinc-700">
+                    End time
+                    <input type="datetime-local" value={formatDateTimeLocal(selectedHealthWorkout.endTime)} onChange={(e) => updateSelectedHealthWorkout({ endTime: dateTimeLocalToIso(e.target.value) })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                  </label>
+                  <label className="text-sm font-medium text-zinc-700">
+                    Duration minutes
+                    <input value={selectedHealthWorkout.duration ?? ""} onChange={(e) => updateSelectedHealthWorkout({ duration: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                  </label>
+                  <label className="text-sm font-medium text-zinc-700">
+                    Distance
+                    <input value={selectedHealthWorkout.distance ?? ""} onChange={(e) => updateSelectedHealthWorkout({ distance: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                  </label>
+                  <label className="text-sm font-medium text-zinc-700">
+                    Calories
+                    <input value={selectedHealthWorkout.calories ?? ""} onChange={(e) => updateSelectedHealthWorkout({ calories: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                  </label>
+                  <label className="text-sm font-medium text-zinc-700">
+                    Avg HR
+                    <input value={selectedHealthWorkout.avgHr ?? ""} onChange={(e) => updateSelectedHealthWorkout({ avgHr: e.target.value, hrSummary: { ...(selectedHealthWorkout.hrSummary ?? {}), avgHr: e.target.value } })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                  </label>
+                </div>
+              )}
+            </div>
+          )}
 
           {!!entry.healthWorkouts?.length && (
             <div className="mt-4 rounded-2xl border border-sky-100 bg-sky-50 p-3">
