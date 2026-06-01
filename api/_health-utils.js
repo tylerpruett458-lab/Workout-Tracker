@@ -116,8 +116,23 @@ function dateFromDateTime(value) {
 
 function getDurationMinutes(row) {
   const durationSeconds = getField(row, DURATION_SECONDS_FIELDS);
+  if (durationSeconds) return roundOne(toNumber(durationSeconds) / 60);
+
   const rawDuration = getField(row, DURATION_FIELDS);
-  return durationSeconds ? roundOne(toNumber(durationSeconds) / 60) : roundOne(toNumber(rawDuration));
+  const rawNumber = toNumber(rawDuration);
+  if (!rawNumber) return 0;
+
+  const durationText = String(rawDuration ?? "").toLowerCase();
+  if (durationText.includes("sec")) return roundOne(rawNumber / 60);
+  if (durationText.includes("hour") || durationText.includes(" hr") || durationText.endsWith("hr")) return roundOne(rawNumber * 60);
+  if (durationText.includes("min")) return roundOne(rawNumber);
+
+  // Health Auto Export workout JSON can send duration as seconds under a generic
+  // "duration" field. Treat unrealistically large minute values as seconds.
+  // Example: 7583.5 means 7,583.5 seconds = 126.4 minutes, not 7,583.5 minutes.
+  if (rawNumber > 360) return roundOne(rawNumber / 60);
+
+  return roundOne(rawNumber);
 }
 
 function isHeartRateRow(row) {
