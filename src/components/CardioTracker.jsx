@@ -523,21 +523,51 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
   };
 
   const healthWorkouts = entry.healthWorkouts ?? [];
-  const selectedHealthWorkout = healthWorkouts.find((workout) => String(workout.id) === String(selectedHealthWorkoutId)) ?? healthWorkouts[0] ?? null;
-  const selectedHealthWorkoutIndex = selectedHealthWorkout
-    ? healthWorkouts.findIndex((workout) => String(workout.id) === String(selectedHealthWorkout.id))
+  const allHealthWorkoutOptions = useMemo(() => {
+    return Object.entries(cardioLog)
+      .flatMap(([date, logEntry]) => (logEntry?.healthWorkouts ?? []).map((workout, index) => ({
+        date,
+        workout,
+        index,
+        key: `${date}::${workout.id ?? index}`
+      })))
+      .sort((a, b) => {
+        const aTime = a.workout?.startTime ? new Date(a.workout.startTime).getTime() : new Date(a.date).getTime();
+        const bTime = b.workout?.startTime ? new Date(b.workout.startTime).getTime() : new Date(b.date).getTime();
+        return bTime - aTime;
+      });
+  }, [cardioLog]);
+
+  const selectedHealthWorkoutOption = allHealthWorkoutOptions.find((option) => option.key === selectedHealthWorkoutId)
+    ?? allHealthWorkoutOptions.find((option) => option.date === selectedDate)
+    ?? allHealthWorkoutOptions[0]
+    ?? null;
+  const selectedHealthWorkout = selectedHealthWorkoutOption?.workout ?? null;
+  const selectedHealthWorkoutDate = selectedHealthWorkoutOption?.date ?? selectedDate;
+  const selectedHealthWorkoutEntry = cardioLog[selectedHealthWorkoutDate] ?? entry;
+  const selectedHealthWorkoutDailyTotal = selectedHealthWorkoutEntry ?? {};
+  const selectedHealthWorkoutIndex = selectedHealthWorkoutOption
+    ? (cardioLog[selectedHealthWorkoutDate]?.healthWorkouts ?? []).findIndex((workout, index) => `${selectedHealthWorkoutDate}::${workout.id ?? index}` === selectedHealthWorkoutOption.key)
     : -1;
 
   useEffect(() => {
-    const workouts = cardioLog[selectedDate]?.healthWorkouts ?? [];
-    if (!workouts.length) {
+    if (!allHealthWorkoutOptions.length) {
       setSelectedHealthWorkoutId("");
       return;
     }
-    if (!workouts.some((workout) => String(workout.id) === String(selectedHealthWorkoutId))) {
-      setSelectedHealthWorkoutId(String(workouts[0].id));
+
+    const sameDateOption = allHealthWorkoutOptions.find((option) => option.date === selectedDate);
+    const currentOption = allHealthWorkoutOptions.find((option) => option.key === selectedHealthWorkoutId);
+
+    if (sameDateOption && currentOption?.date !== selectedDate) {
+      setSelectedHealthWorkoutId(sameDateOption.key);
+      return;
     }
-  }, [selectedDate, cardioLog, selectedHealthWorkoutId]);
+
+    if (!currentOption) {
+      setSelectedHealthWorkoutId((sameDateOption ?? allHealthWorkoutOptions[0]).key);
+    }
+  }, [selectedDate, selectedHealthWorkoutId, allHealthWorkoutOptions]);
 
   const selectedWeekStart = startOfWeek(selectedDate);
   const selectedWeekDates = Array.from({ length: 7 }, (_, index) => dateKey(addDaysToDate(selectedWeekStart, index)));
@@ -564,8 +594,11 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
   }
 
   function updateSelectedHealthWorkout(patch) {
-    if (selectedHealthWorkoutIndex < 0) return;
-    const nextWorkouts = healthWorkouts.map((workout, index) => {
+    if (selectedHealthWorkoutIndex < 0 || !selectedHealthWorkoutOption) return;
+    const targetDate = selectedHealthWorkoutOption.date;
+    const targetEntry = cardioLog[targetDate] ?? {};
+    const targetWorkouts = targetEntry.healthWorkouts ?? [];
+    const nextWorkouts = targetWorkouts.map((workout, index) => {
       if (index !== selectedHealthWorkoutIndex) return workout;
       const nextWorkout = { ...workout, ...patch };
       if (patch.startTime || patch.endTime) {
@@ -575,19 +608,27 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
       }
       return nextWorkout;
     });
-    updateNested("cardioLog", selectedDate, recalculateEntryFromHealthWorkouts(entry, nextWorkouts));
+    updateNested("cardioLog", targetDate, recalculateEntryFromHealthWorkouts(targetEntry, nextWorkouts));
+    if (selectedDate !== targetDate) setSelectedDate(targetDate);
   }
 
   function deleteSelectedHealthWorkout() {
-    if (selectedHealthWorkoutIndex < 0) return;
+    if (selectedHealthWorkoutIndex < 0 || !selectedHealthWorkoutOption) return;
     if (!window.confirm("Remove this imported workout from the selected cardio day?")) return;
-    const nextWorkouts = healthWorkouts.filter((_, index) => index !== selectedHealthWorkoutIndex);
+    const targetDate = selectedHealthWorkoutOption.date;
+    const targetEntry = cardioLog[targetDate] ?? {};
+    const targetWorkouts = targetEntry.healthWorkouts ?? [];
+    const nextWorkouts = targetWorkouts.filter((_, index) => index !== selectedHealthWorkoutIndex);
     if (!nextWorkouts.length) {
-      updateNested("cardioLog", selectedDate, undefined);
+      updateNested("cardioLog", targetDate, undefined);
+      setSelectedHealthWorkoutId("");
+      if (selectedDate !== targetDate) setSelectedDate(targetDate);
       return;
     }
-    updateNested("cardioLog", selectedDate, recalculateEntryFromHealthWorkouts(entry, nextWorkouts));
-    setSelectedHealthWorkoutId(String(nextWorkouts[0]?.id ?? ""));
+    updateNested("cardioLog", targetDate, recalculateEntryFromHealthWorkouts(targetEntry, nextWorkouts));
+    const nextKey = `${targetDate}::${nextWorkouts[0]?.id ?? 0}`;
+    setSelectedHealthWorkoutId(nextKey);
+    if (selectedDate !== targetDate) setSelectedDate(targetDate);
   }
 
   function clearEntry() {
@@ -806,26 +847,34 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
 
           <textarea value={entry.notes ?? ""} onChange={(e) => updateCardioEntry({ notes: e.target.value })} placeholder="Cardio notes: pace, incline, machine, recovery, breathing, etc." className="mt-3 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" rows={2} />
 
-          {!!healthWorkouts.length && (
+          {!!allHealthWorkoutOptions.length && (
             <div className="mt-4 rounded-2xl border border-emerald-100 bg-emerald-50 p-3">
               <div className="text-sm font-semibold text-emerald-900">Edit imported cardio workout</div>
               <p className="mt-1 text-xs text-emerald-800">
-                Select a specific synced/imported workout from this date, then adjust the details. The daily cardio totals above recalculate automatically.
+                Select any synced/imported workout, even if it is not on the currently selected cardio date. Choosing a workout will keep the editor visible and update the cardio date when you edit it.
               </p>
               <div className="mt-3 grid gap-3 md:grid-cols-[2fr_1fr_auto]">
                 <label className="text-sm font-medium text-zinc-700">
                   Imported workout
-                  <select value={selectedHealthWorkout ? String(selectedHealthWorkout.id) : ""} onChange={(e) => setSelectedHealthWorkoutId(e.target.value)} className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm">
-                    {healthWorkouts.map((workout, index) => (
-                      <option key={workout.id ?? index} value={String(workout.id)}>
-                        {workout.sourceType || workout.type || "Workout"} · {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : `#${index + 1}`} · {workout.duration || "—"} min
+                  <select
+                    value={selectedHealthWorkoutOption?.key ?? ""}
+                    onChange={(e) => {
+                      const option = allHealthWorkoutOptions.find((item) => item.key === e.target.value);
+                      setSelectedHealthWorkoutId(e.target.value);
+                      if (option?.date) setSelectedDate(option.date);
+                    }}
+                    className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm"
+                  >
+                    {allHealthWorkoutOptions.map(({ date, workout, index, key }) => (
+                      <option key={key} value={key}>
+                        {displayDate(date)} · {workout.sourceType || workout.type || "Workout"} · {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : `#${index + 1}`} · {workout.duration || "—"} min
                       </option>
                     ))}
                   </select>
                 </label>
                 <div className="rounded-xl bg-white px-3 py-2 text-xs text-zinc-600">
-                  <div className="font-semibold text-zinc-800">Daily total</div>
-                  {entry.duration || "0"} min · {entry.calories || "0"} cal · Avg HR {entry.avgHr || "—"}
+                  <div className="font-semibold text-zinc-800">Selected workout day total</div>
+                  {selectedHealthWorkoutDailyTotal.duration || "0"} min · {selectedHealthWorkoutDailyTotal.calories || "0"} cal · Avg HR {selectedHealthWorkoutDailyTotal.avgHr || "—"}
                 </div>
                 <Button variant="outline" onClick={deleteSelectedHealthWorkout} className="md:mt-5">Remove workout</Button>
               </div>
