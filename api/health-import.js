@@ -1,4 +1,4 @@
-import { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, normalizeSupplementalMetricSamples, buildHeartRateUpdateForWorkout, buildSupplementalMetricUpdateForWorkout, supabaseRequest } from "./_health-utils.js";
+import { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, normalizePayloadToSupplementalMetricSamples, buildHeartRateUpdateForWorkout, buildSupplementalMetricUpdateForWorkout, supabaseRequest } from "./_health-utils.js";
 
 export default async function handler(req, res) {
   cors(res);
@@ -28,7 +28,7 @@ export default async function handler(req, res) {
     }
 
     const heartRateSamples = normalizePayloadToHeartRateSamples(contentType, bodyText);
-    const supplementalSamples = normalizeSupplementalMetricSamples(contentType, bodyText);
+    const supplementalSamples = normalizePayloadToSupplementalMetricSamples(contentType, bodyText);
 
     const allSamples = [...heartRateSamples, ...supplementalSamples];
     if (!allSamples.length) {

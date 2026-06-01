@@ -185,7 +185,8 @@ function metricValue(row) {
 }
 
 function normalizeSupplementalMetricSamples(rows) {
-  return rows
+  const safeRows = Array.isArray(rows) ? rows : [];
+  return safeRows
     .map((row) => {
       const kind = metricKind(row);
       if (kind !== "active_energy" && kind !== "distance") return null;
@@ -393,6 +394,17 @@ function normalizePayloadToHeartRateSamples(contentType, text) {
   return normalizeHeartRateSamples(rows);
 }
 
+function normalizePayloadToSupplementalMetricSamples(contentType, text) {
+  let rows = [];
+  if (contentType.includes("json")) {
+    const parsed = JSON.parse(text || "{}");
+    rows = flattenHealthExportRows(parsed);
+  } else {
+    rows = parseCsv(text || "");
+  }
+  return normalizeSupplementalMetricSamples(Array.isArray(rows) ? rows : []);
+}
+
 function mergeHeartRateSamples(existing = [], incoming = []) {
   const map = new Map();
   [...(existing ?? []), ...(incoming ?? [])].forEach((sample) => {
@@ -487,4 +499,4 @@ async function supabaseRequest(path, options = {}) {
   return data;
 }
 
-export { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, normalizeSupplementalMetricSamples, buildHeartRateUpdateForWorkout, buildSupplementalMetricUpdateForWorkout, supabaseRequest };
+export { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, normalizePayloadToSupplementalMetricSamples, normalizeSupplementalMetricSamples, buildHeartRateUpdateForWorkout, buildSupplementalMetricUpdateForWorkout, supabaseRequest };
