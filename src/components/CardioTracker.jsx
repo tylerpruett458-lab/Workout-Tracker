@@ -452,38 +452,27 @@ function mergeImportedCardio(existingLog, importedEntries) {
       continue;
     }
 
-    const existingDuration = toNumber(existing.duration);
-    const incomingDuration = toNumber(entry.duration);
-    const existingCalories = toNumber(existing.calories);
-    const incomingCalories = toNumber(entry.calories);
-    const existingDistance = toNumber(existing.distance);
-    const incomingDistance = toNumber(entry.distance);
-    const existingHr = toNumber(existing.avgHr);
-    const incomingHr = toNumber(entry.avgHr);
-    const totalDuration = existingDuration + incomingDuration;
+    const existingWorkouts = existing.healthWorkouts ?? [];
+    const incomingWorkouts = entry.healthWorkouts ?? [];
+    const workoutMap = new Map();
+    existingWorkouts.forEach((item, index) => workoutMap.set(String(item.id ?? `existing-${index}`), item));
+    incomingWorkouts.forEach((item, index) => workoutMap.set(String(item.id ?? `incoming-${index}`), item));
+    const combinedWorkouts = Array.from(workoutMap.values()).sort((a, b) => {
+      const aTime = a?.startTime ? new Date(a.startTime).getTime() : 0;
+      const bTime = b?.startTime ? new Date(b.startTime).getTime() : 0;
+      return aTime - bTime;
+    });
 
-    const weightedHr = existingHr && incomingHr && totalDuration
-      ? roundOne(((existingHr * existingDuration) + (incomingHr * incomingDuration)) / totalDuration)
-      : incomingHr || existingHr || "";
-
-    nextLog[date] = {
+    const baseEntry = {
       ...existing,
-      completed: true,
-      type: existing.type && existing.type !== "Other" ? existing.type : entry.type,
-      intensity: existing.intensity ?? entry.intensity,
-      duration: totalDuration ? String(roundOne(totalDuration)) : existing.duration ?? entry.duration,
-      distance: existingDistance + incomingDistance ? String(roundOne(existingDistance + incomingDistance)) : existing.distance ?? entry.distance,
-      calories: existingCalories + incomingCalories ? String(roundOne(existingCalories + incomingCalories)) : existing.calories ?? entry.calories,
-      avgHr: weightedHr ? String(weightedHr) : "",
-      notes: [existing.notes, entry.notes].filter(Boolean).join("\n"),
-      healthWorkouts: [...(existing.healthWorkouts ?? []), ...(entry.healthWorkouts ?? [])]
+      notes: Array.from(new Set([existing.notes, entry.notes].filter(Boolean))).join("\n")
     };
+    nextLog[date] = recalculateEntryFromHealthWorkouts(baseEntry, combinedWorkouts);
     merged += 1;
   }
 
   return { nextLog, created, merged, hrMapped };
 }
-
 
 function summarizeEntries(entries) {
   return entries.reduce(
@@ -502,6 +491,7 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
   const [importSummary, setImportSummary] = useState("");
   const [syncSummary, setSyncSummary] = useState("");
   const [syncingHealth, setSyncingHealth] = useState(false);
+  const [savingRemoteHealth, setSavingRemoteHealth] = useState(false);
   const [selectedHealthWorkoutId, setSelectedHealthWorkoutId] = useState("");
   const fileInputRef = useRef(null);
 
@@ -640,14 +630,161 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
     updateState({ cardioGoals: { ...goals, [key]: value } });
   }
 
-
-  async function syncAppleHealth() {
+  function getHealthSyncSecret() {
     let secret = localStorage.getItem("health_sync_secret") || "";
     if (!secret) {
       secret = window.prompt("Enter your Apple Health sync secret. This is the same value you saved in Vercel as HEALTH_IMPORT_SECRET.");
-      if (!secret) return;
+      if (!secret) return "";
       localStorage.setItem("health_sync_secret", secret);
     }
+    return secret;
+  }
+
+  function makeSyncedWorkoutPayload(workout) {
+    if (!workout) return null;
+    return {
+      external_id: workout.id,
+      workout: {
+        ...workout,
+        external_id: workout.id,
+        date: workout.date ?? selectedHealthWorkoutDate
+      }
+    };
+  }
+
+  async function saveSelectedHealthWorkoutToSupabase() {
+    if (!selectedHealthWorkout) return;
+    const secret = getHealthSyncSecret();
+    if (!secret) return;
+    const payload = makeSyncedWorkoutPayload(selectedHealthWorkout);
+    if (!payload?.external_id) {
+      alert("This imported workout does not have a sync ID, so it can only be edited locally.");
+      return;
+    }
+
+    setSavingRemoteHealth(true);
+    setSyncSummary("Saving imported workout changes to Supabase...");
+    try {
+      const response = await fetch("/api/health-workout", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "x-health-secret": secret
+        },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result?.error || "Could not save imported workout.");
+      setSyncSummary("Saved imported workout changes to Supabase. Future syncs will keep the corrected values.");
+    } catch (error) {
+      console.error(error);
+      setSyncSummary(error.message || "Could not save imported workout.");
+      alert(error.message || "Could not save imported workout.");
+    } finally {
+      setSavingRemoteHealth(false);
+    }
+  }
+
+  async function deleteSelectedHealthWorkoutFromSupabase() {
+    if (!selectedHealthWorkout) return;
+    if (!window.confirm("Delete this imported workout from Supabase and remove it from the tracker?")) return;
+    const secret = getHealthSyncSecret();
+    if (!secret) return;
+    const externalId = selectedHealthWorkout.id;
+    if (!externalId) {
+      deleteSelectedHealthWorkout();
+      return;
+    }
+
+    setSavingRemoteHealth(true);
+    setSyncSummary("Deleting imported workout from Supabase...");
+    try {
+      const response = await fetch("/api/health-workout", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          "x-health-secret": secret
+        },
+        body: JSON.stringify({ external_id: externalId })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result?.error || "Could not delete imported workout.");
+
+      const targetDate = selectedHealthWorkoutOption?.date ?? selectedDate;
+      const targetEntry = cardioLog[targetDate] ?? {};
+      const targetWorkouts = targetEntry.healthWorkouts ?? [];
+      const nextWorkouts = targetWorkouts.filter((workout) => String(workout.id) !== String(externalId));
+      if (!nextWorkouts.length) {
+        updateNested("cardioLog", targetDate, undefined);
+        setSelectedHealthWorkoutId("");
+      } else {
+        updateNested("cardioLog", targetDate, recalculateEntryFromHealthWorkouts(targetEntry, nextWorkouts));
+        setSelectedHealthWorkoutId(`${targetDate}::${nextWorkouts[0]?.id ?? 0}`);
+      }
+      if (selectedDate !== targetDate) setSelectedDate(targetDate);
+      setSyncSummary("Deleted imported workout from Supabase and removed it from the tracker.");
+    } catch (error) {
+      console.error(error);
+      setSyncSummary(error.message || "Could not delete imported workout.");
+      alert(error.message || "Could not delete imported workout.");
+    } finally {
+      setSavingRemoteHealth(false);
+    }
+  }
+
+  function clearLocalSyncedHealthWorkouts() {
+    if (!window.confirm("Clear all locally synced Apple Health workouts from the tracker? This does not delete anything from Supabase.")) return;
+    const nextLog = { ...cardioLog };
+    Object.entries(nextLog).forEach(([date, logEntry]) => {
+      if (!logEntry?.healthWorkouts?.length) return;
+      const nextEntry = { ...logEntry, healthWorkouts: [] };
+      nextLog[date] = recalculateEntryFromHealthWorkouts(nextEntry, []);
+    });
+    Object.keys(nextLog).forEach((date) => {
+      const item = nextLog[date];
+      if (!item?.completed && !item?.duration && !item?.distance && !item?.calories && !item?.notes) delete nextLog[date];
+    });
+    updateState({ cardioLog: nextLog });
+    setSelectedHealthWorkoutId("");
+    setSyncSummary("Cleared locally synced Apple Health workouts. Use Sync Apple Health to re-import from Supabase.");
+  }
+
+  async function syncSelectedCardioDate() {
+    const secret = getHealthSyncSecret();
+    if (!secret) return;
+    setSyncingHealth(true);
+    setSyncSummary(`Syncing Apple Health workouts for ${displayDate(selectedDate)}...`);
+    try {
+      const response = await fetch(`/api/health-sync?date=${encodeURIComponent(selectedDate)}`, {
+        headers: { "x-health-secret": secret }
+      });
+      if (response.status === 401 || response.status === 403) {
+        localStorage.removeItem("health_sync_secret");
+        throw new Error("Sync secret was rejected. Re-enter the same secret saved in Vercel as HEALTH_IMPORT_SECRET.");
+      }
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error || "Apple Health date sync failed.");
+      const importedEntries = normalizeSyncedHealthRows(payload.workouts ?? []);
+      if (!importedEntries.length) {
+        setSyncSummary(`No synced Apple Health workouts found for ${displayDate(selectedDate)}.`);
+        return;
+      }
+      const { nextLog, created, merged, hrMapped } = mergeImportedCardio(cardioLog, importedEntries);
+      updateState({ cardioLog: nextLog });
+      setSyncSummary(`Synced ${importedEntries.length} Apple Health workout${importedEntries.length === 1 ? "" : "s"} for ${displayDate(selectedDate)}. Created ${created}; merged ${merged}; mapped HR samples to ${hrMapped}.`);
+    } catch (error) {
+      console.error(error);
+      setSyncSummary(error.message || "Apple Health date sync failed.");
+      alert(error.message || "Apple Health date sync failed.");
+    } finally {
+      setSyncingHealth(false);
+    }
+  }
+
+
+  async function syncAppleHealth() {
+    const secret = getHealthSyncSecret();
+    if (!secret) return;
 
     setSyncingHealth(true);
     setSyncSummary("Syncing Apple Health data...");
@@ -792,12 +929,52 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
             </div>
             <div className="flex flex-wrap gap-2">
               <Button onClick={syncAppleHealth} disabled={syncingHealth}>{syncingHealth ? "Syncing..." : "Sync Apple Health"}</Button>
+              <Button variant="outline" onClick={syncSelectedCardioDate} disabled={syncingHealth}>Sync selected date</Button>
+              <Button variant="outline" onClick={clearLocalSyncedHealthWorkouts}>Clear local sync</Button>
               <Button variant="outline" onClick={forgetHealthSyncSecret}>Forget Sync Secret</Button>
               <Button variant="outline" onClick={() => fileInputRef.current?.click()}>Import Apple Health CSV/JSON</Button>
               <input ref={fileInputRef} type="file" accept=".csv,.json,text/csv,application/json" onChange={handleHealthImport} className="hidden" />
             </div>
           </div>
         </div>
+
+        {!!allHealthWorkoutOptions.length && (
+          <div className="rounded-2xl border border-emerald-100 bg-white p-4">
+            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-zinc-900">Imported Apple Health Workouts</h3>
+                <p className="mt-1 text-xs text-zinc-600">Select a synced workout to edit it, save corrections back to Supabase, or delete a bad import.</p>
+              </div>
+              <div className="text-xs text-zinc-500">{allHealthWorkoutOptions.length} synced workout{allHealthWorkoutOptions.length === 1 ? "" : "s"}</div>
+            </div>
+            <div className="mt-3 max-h-64 space-y-2 overflow-auto pr-1">
+              {allHealthWorkoutOptions.map(({ date, workout, key }) => {
+                const selected = key === selectedHealthWorkoutOption?.key;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => {
+                      setSelectedHealthWorkoutId(key);
+                      setSelectedDate(date);
+                    }}
+                    className={`w-full rounded-xl border px-3 py-2 text-left text-sm ${selected ? "border-emerald-300 bg-emerald-50" : "border-zinc-200 bg-zinc-50 hover:bg-zinc-100"}`}
+                  >
+                    <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                      <div className="font-semibold text-zinc-900">{displayDate(date)} · {workout.sourceType || workout.type || "Workout"}</div>
+                      <div className="text-xs text-zinc-500">
+                        {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "No start"}
+                        {workout.endTime ? ` – ${new Date(workout.endTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}
+                      </div>
+                    </div>
+                    <div className="mt-1 text-xs text-zinc-600">
+                      {workout.duration || "—"} min · {workout.distance || "—"} distance · {workout.calories || "—"} cal · Avg HR {workout.avgHr || "—"}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         <div className="rounded-2xl bg-white p-4">
           <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]">
@@ -876,7 +1053,11 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
                   <div className="font-semibold text-zinc-800">Selected workout day total</div>
                   {selectedHealthWorkoutDailyTotal.duration || "0"} min · {selectedHealthWorkoutDailyTotal.calories || "0"} cal · Avg HR {selectedHealthWorkoutDailyTotal.avgHr || "—"}
                 </div>
-                <Button variant="outline" onClick={deleteSelectedHealthWorkout} className="md:mt-5">Remove workout</Button>
+                <div className="flex flex-wrap gap-2 md:mt-5">
+                  <Button onClick={saveSelectedHealthWorkoutToSupabase} disabled={savingRemoteHealth}>{savingRemoteHealth ? "Saving..." : "Save to Supabase"}</Button>
+                  <Button variant="outline" onClick={deleteSelectedHealthWorkout}>Remove locally</Button>
+                  <Button variant="outline" onClick={deleteSelectedHealthWorkoutFromSupabase} disabled={savingRemoteHealth}>Delete from Supabase</Button>
+                </div>
               </div>
 
               {selectedHealthWorkout && (

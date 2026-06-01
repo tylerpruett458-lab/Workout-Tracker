@@ -11,7 +11,9 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing Supabase environment variables." });
     }
     const key = encodeURIComponent(userKey());
-    const data = await supabaseRequest(`/rest/v1/health_workouts?user_key=eq.${key}&order=start_time.desc&limit=1000`, { method: "GET" });
+    const date = req.query?.date ? String(req.query.date) : "";
+    const dateFilter = date ? `&workout_date=eq.${encodeURIComponent(date)}` : "";
+    const data = await supabaseRequest(`/rest/v1/health_workouts?user_key=eq.${key}${dateFilter}&order=start_time.desc&limit=1000`, { method: "GET" });
     return res.status(200).json({ ok: true, workouts: data || [] });
   } catch (error) {
     console.error("health-sync failed", error);
