@@ -47,10 +47,18 @@ export default async function handler(req, res) {
     let hrUpdated = 0;
     let metricUpdated = 0;
     const updatedWorkouts = [];
+    const workoutsByDate = new Map();
+    for (const workout of existingWorkouts ?? []) {
+      const date = workout.workout_date || (workout.start_time ? new Date(workout.start_time).toISOString().slice(0, 10) : "");
+      if (!date) continue;
+      workoutsByDate.set(date, (workoutsByDate.get(date) ?? 0) + 1);
+    }
 
     for (const workout of existingWorkouts ?? []) {
+      const workoutDate = workout.workout_date || (workout.start_time ? new Date(workout.start_time).toISOString().slice(0, 10) : "");
+      const allowSameDayFallback = Boolean(workoutDate && workoutsByDate.get(workoutDate) === 1);
       const hrPatch = heartRateSamples.length ? buildHeartRateUpdateForWorkout(workout, heartRateSamples) : null;
-      const metricPatch = supplementalSamples.length ? buildSupplementalMetricUpdateForWorkout(workout, supplementalSamples) : null;
+      const metricPatch = supplementalSamples.length ? buildSupplementalMetricUpdateForWorkout(workout, supplementalSamples, { allowSameDayFallback }) : null;
       const patch = { ...(hrPatch ?? {}), ...(metricPatch ?? {}) };
       if (!Object.keys(patch).length) continue;
 

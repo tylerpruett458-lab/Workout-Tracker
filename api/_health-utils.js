@@ -197,6 +197,7 @@ function normalizeSupplementalMetricSamples(rows) {
         kind,
         timestamp: parsed.getTime(),
         time: parsed.toISOString(),
+        date: dateKey(parsed),
         value,
         units: String(row?.units ?? row?.unit ?? "").toLowerCase(),
         raw: row
@@ -441,12 +442,32 @@ function buildHeartRateUpdateForWorkout(workout, samples) {
 }
 
 
-function buildSupplementalMetricUpdateForWorkout(workout, samples) {
+function convertDistanceValueToMiles(sample) {
+  const value = toNumber(sample.value);
+  const units = String(sample.units || "").toLowerCase();
+  if (units === "m" || units === "meter" || units === "meters") return value / 1609.344;
+  if (units === "km" || units === "kilometer" || units === "kilometers") return value * 0.621371;
+  return value;
+}
+
+function buildSupplementalMetricUpdateForWorkout(workout, samples, options = {}) {
   const start = workout.start_time ? new Date(workout.start_time).getTime() : null;
   const end = workout.end_time ? new Date(workout.end_time).getTime() : null;
   if (!start || !end || end <= start) return null;
 
-  const matched = samples.filter((sample) => sample.timestamp >= start && sample.timestamp <= end);
+  const workoutDate = workout.workout_date || dateKey(new Date(start));
+  let matched = samples.filter((sample) => sample.timestamp >= start && sample.timestamp <= end);
+  let usedFallback = false;
+
+  // Summarized Health Auto Export data may arrive as a daily row at midnight.
+  // That timestamp will not overlap the workout window. To avoid assigning a whole-day total
+  // to the wrong workout, only use same-day fallback when the caller confirms there is exactly
+  // one workout on that day.
+  if (!matched.length && options.allowSameDayFallback) {
+    matched = samples.filter((sample) => sample.date === workoutDate);
+    usedFallback = matched.length > 0;
+  }
+
   if (!matched.length) return null;
 
   const activeEnergy = matched
@@ -455,12 +476,7 @@ function buildSupplementalMetricUpdateForWorkout(workout, samples) {
 
   const distance = matched
     .filter((sample) => sample.kind === "distance")
-    .reduce((sum, sample) => {
-      const value = toNumber(sample.value);
-      const units = String(sample.units || "").toLowerCase();
-      if (units === "m" || units === "meter" || units === "meters") return sum + roundOne(value / 1609.344);
-      return sum + value;
-    }, 0);
+    .reduce((sum, sample) => sum + convertDistanceValueToMiles(sample), 0);
 
   const patch = {};
   if (activeEnergy > 0) patch.calories = roundOne(activeEnergy);
@@ -471,6 +487,7 @@ function buildSupplementalMetricUpdateForWorkout(workout, samples) {
   patch.raw_payload = {
     ...(workout.raw_payload && typeof workout.raw_payload === "object" ? workout.raw_payload : {}),
     supplementalMetricsUpdatedAt: new Date().toISOString(),
+    supplementalMetricsFallback: usedFallback ? "same-day single-workout fallback" : "timestamp overlap",
     supplementalMetricSamples: matched.slice(-500)
   };
 
