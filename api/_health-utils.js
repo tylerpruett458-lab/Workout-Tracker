@@ -18,6 +18,7 @@ const END_FIELDS = ["enddate", "end date", "endtime", "end time", "end", "workou
 const SAMPLE_TIME_FIELDS = ["time", "timestamp", "date", "datetime", "startdate", "start date", "creationdate", "creation date"];
 const SAMPLE_VALUE_FIELDS = ["value", "bpm", "heartrate", "heart rate", "heart rate bpm", "heart_rate", "qty", "quantity", "avg", "average", "Avg", "Average"];
 const RECORD_TYPE_FIELDS = ["recordtype", "record type", "type", "sampletype", "sample type", "identifier", "name"];
+const METRIC_VALUE_FIELDS = ["sum", "total", "value", "qty", "quantity", "amount", "distance", "calories", "energy", "activeenergy", "active energy", "Avg", "Average", "avg", "average"];
 
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -135,11 +136,37 @@ function getDurationMinutes(row) {
   return roundOne(rawNumber);
 }
 
+function metricText(row) {
+  return [
+    getField(row, RECORD_TYPE_FIELDS),
+    row?.name,
+    row?.recordType,
+    row?.recordtype,
+    row?.identifier,
+    row?.sampleType,
+    row?.type,
+    row?.units
+  ].map((value) => String(value ?? "").toLowerCase()).join(" ");
+}
+
+function metricKind(row) {
+  const text = metricText(row).replace(/[_-]+/g, " ");
+  if (text.includes("heart rate") || text.includes("heartrate") || text.includes("count/min") || /\bhr\b/.test(text)) return "heart_rate";
+  if (text.includes("active energy") || text.includes("activeenergy") || text.includes("calorie") || text.includes("kcal") || text.includes("cal")) return "active_energy";
+  if (text.includes("walking running distance") || text.includes("walking + running distance") || text.includes("walking_running_distance")) return "distance";
+  if (text.includes("cycling distance") || text.includes("distance cycling") || text.includes("distance") || text.includes("mile") || text.includes("kilometer") || /\bkm\b/.test(text)) return "distance";
+  return "";
+}
+
 function isHeartRateRow(row) {
-  const typeText = String(getField(row, RECORD_TYPE_FIELDS) ?? "").toLowerCase();
-  const hasHrValue = Boolean(getField(row, SAMPLE_VALUE_FIELDS)) || Boolean(getField(row, HR_FIELDS));
   const hasTime = Boolean(getField(row, SAMPLE_TIME_FIELDS));
-  return hasTime && hasHrValue && (typeText.includes("heart") || typeText.includes("hr") || !getField(row, DURATION_FIELDS));
+  const hasHrValue = Boolean(getField(row, SAMPLE_VALUE_FIELDS)) || Boolean(getField(row, HR_FIELDS));
+  return hasTime && hasHrValue && metricKind(row) === "heart_rate";
+}
+
+function plausibleHeartRate(value) {
+  const bpm = toNumber(value);
+  return bpm >= 30 && bpm <= 240 ? bpm : 0;
 }
 
 function normalizeHeartRateSamples(rows) {
@@ -147,8 +174,32 @@ function normalizeHeartRateSamples(rows) {
     .filter(isHeartRateRow)
     .map((row) => {
       const parsed = parseHealthDateTime(getField(row, SAMPLE_TIME_FIELDS));
-      const bpm = toNumber(getField(row, SAMPLE_VALUE_FIELDS) || getField(row, HR_FIELDS));
+      const bpm = plausibleHeartRate(getField(row, SAMPLE_VALUE_FIELDS) || getField(row, HR_FIELDS));
       return parsed && bpm ? { timestamp: parsed.getTime(), time: parsed.toISOString(), bpm } : null;
+    })
+    .filter(Boolean);
+}
+
+function metricValue(row) {
+  return toNumber(getField(row, METRIC_VALUE_FIELDS) || getField(row, SAMPLE_VALUE_FIELDS));
+}
+
+function normalizeSupplementalMetricSamples(rows) {
+  return rows
+    .map((row) => {
+      const kind = metricKind(row);
+      if (kind !== "active_energy" && kind !== "distance") return null;
+      const parsed = parseHealthDateTime(getField(row, SAMPLE_TIME_FIELDS));
+      const value = metricValue(row);
+      if (!parsed || !value) return null;
+      return {
+        kind,
+        timestamp: parsed.getTime(),
+        time: parsed.toISOString(),
+        value,
+        units: String(row?.units ?? row?.unit ?? "").toLowerCase(),
+        raw: row
+      };
     })
     .filter(Boolean);
 }
@@ -346,7 +397,7 @@ function mergeHeartRateSamples(existing = [], incoming = []) {
   const map = new Map();
   [...(existing ?? []), ...(incoming ?? [])].forEach((sample) => {
     const timestamp = Number(sample?.timestamp ?? (sample?.time ? new Date(sample.time).getTime() : NaN));
-    const bpm = toNumber(sample?.bpm);
+    const bpm = plausibleHeartRate(sample?.bpm);
     if (!Number.isFinite(timestamp) || !bpm) return;
     map.set(`${timestamp}-${bpm}`, {
       timestamp,
@@ -377,6 +428,43 @@ function buildHeartRateUpdateForWorkout(workout, samples) {
   };
 }
 
+
+function buildSupplementalMetricUpdateForWorkout(workout, samples) {
+  const start = workout.start_time ? new Date(workout.start_time).getTime() : null;
+  const end = workout.end_time ? new Date(workout.end_time).getTime() : null;
+  if (!start || !end || end <= start) return null;
+
+  const matched = samples.filter((sample) => sample.timestamp >= start && sample.timestamp <= end);
+  if (!matched.length) return null;
+
+  const activeEnergy = matched
+    .filter((sample) => sample.kind === "active_energy")
+    .reduce((sum, sample) => sum + toNumber(sample.value), 0);
+
+  const distance = matched
+    .filter((sample) => sample.kind === "distance")
+    .reduce((sum, sample) => {
+      const value = toNumber(sample.value);
+      const units = String(sample.units || "").toLowerCase();
+      if (units === "m" || units === "meter" || units === "meters") return sum + roundOne(value / 1609.344);
+      return sum + value;
+    }, 0);
+
+  const patch = {};
+  if (activeEnergy > 0) patch.calories = roundOne(activeEnergy);
+  if (distance > 0) patch.distance = roundOne(distance);
+
+  if (!Object.keys(patch).length) return null;
+
+  patch.raw_payload = {
+    ...(workout.raw_payload && typeof workout.raw_payload === "object" ? workout.raw_payload : {}),
+    supplementalMetricsUpdatedAt: new Date().toISOString(),
+    supplementalMetricSamples: matched.slice(-500)
+  };
+
+  return patch;
+}
+
 async function supabaseRequest(path, options = {}) {
   const url = `${process.env.SUPABASE_URL}${path}`;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -399,4 +487,4 @@ async function supabaseRequest(path, options = {}) {
   return data;
 }
 
-export { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, buildHeartRateUpdateForWorkout, supabaseRequest };
+export { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, normalizeSupplementalMetricSamples, buildHeartRateUpdateForWorkout, buildSupplementalMetricUpdateForWorkout, supabaseRequest };

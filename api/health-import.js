@@ -1,4 +1,4 @@
-import { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, buildHeartRateUpdateForWorkout, supabaseRequest } from "./_health-utils.js";
+import { cors, verifySecret, userKey, readRequestBody, normalizePayloadToRows, normalizePayloadToHeartRateSamples, normalizeSupplementalMetricSamples, buildHeartRateUpdateForWorkout, buildSupplementalMetricUpdateForWorkout, supabaseRequest } from "./_health-utils.js";
 
 export default async function handler(req, res) {
   cors(res);
@@ -27,13 +27,16 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, imported: Array.isArray(data) ? data.length : workouts.length, updated: 0, workouts: data || [] });
     }
 
-    const samples = normalizePayloadToHeartRateSamples(contentType, bodyText);
-    if (!samples.length) {
-      return res.status(200).json({ ok: true, imported: 0, updated: 0, message: "No workouts or timestamped heart-rate samples found in payload." });
+    const heartRateSamples = normalizePayloadToHeartRateSamples(contentType, bodyText);
+    const supplementalSamples = normalizeSupplementalMetricSamples(contentType, bodyText);
+
+    const allSamples = [...heartRateSamples, ...supplementalSamples];
+    if (!allSamples.length) {
+      return res.status(200).json({ ok: true, imported: 0, updated: 0, message: "No workouts, timestamped heart-rate samples, distance samples, or active-energy samples found in payload." });
     }
 
-    const minTime = Math.min(...samples.map((sample) => sample.timestamp));
-    const maxTime = Math.max(...samples.map((sample) => sample.timestamp));
+    const minTime = Math.min(...allSamples.map((sample) => sample.timestamp));
+    const maxTime = Math.max(...allSamples.map((sample) => sample.timestamp));
     const minIso = encodeURIComponent(new Date(minTime).toISOString());
     const maxIso = encodeURIComponent(new Date(maxTime).toISOString());
     const existingWorkouts = await supabaseRequest(
@@ -41,28 +44,38 @@ export default async function handler(req, res) {
       { method: "GET" }
     );
 
-    let updated = 0;
+    let hrUpdated = 0;
+    let metricUpdated = 0;
     const updatedWorkouts = [];
+
     for (const workout of existingWorkouts ?? []) {
-      const patch = buildHeartRateUpdateForWorkout(workout, samples);
-      if (!patch) continue;
+      const hrPatch = heartRateSamples.length ? buildHeartRateUpdateForWorkout(workout, heartRateSamples) : null;
+      const metricPatch = supplementalSamples.length ? buildSupplementalMetricUpdateForWorkout(workout, supplementalSamples) : null;
+      const patch = { ...(hrPatch ?? {}), ...(metricPatch ?? {}) };
+      if (!Object.keys(patch).length) continue;
+
       const result = await supabaseRequest(`/rest/v1/health_workouts?id=eq.${encodeURIComponent(workout.id)}`, {
         method: "PATCH",
         headers: { Prefer: "return=representation" },
         body: JSON.stringify(patch)
       });
       if (Array.isArray(result) && result[0]) updatedWorkouts.push(result[0]);
-      updated += 1;
+      if (hrPatch) hrUpdated += 1;
+      if (metricPatch) metricUpdated += 1;
     }
 
+    const updated = new Set(updatedWorkouts.map((workout) => workout.id)).size || Math.max(hrUpdated, metricUpdated);
     return res.status(200).json({
       ok: true,
       imported: 0,
       updated,
-      samples: samples.length,
+      hrUpdated,
+      metricUpdated,
+      heartRateSamples: heartRateSamples.length,
+      supplementalSamples: supplementalSamples.length,
       message: updated
-        ? `Mapped ${samples.length} heart-rate samples to ${updated} existing workout${updated === 1 ? "" : "s"}.`
-        : "Heart-rate samples received, but no existing workouts overlapped their timestamps. Import workouts first or expand the workout export date range.",
+        ? `Mapped ${heartRateSamples.length} heart-rate sample${heartRateSamples.length === 1 ? "" : "s"} and ${supplementalSamples.length} distance/energy sample${supplementalSamples.length === 1 ? "" : "s"} to existing workout rows.`
+        : "Metric samples received, but no existing workouts overlapped their timestamps. Import workouts first or use a metric date range that overlaps workout start/end times.",
       workouts: updatedWorkouts
     });
   } catch (error) {
