@@ -486,6 +486,75 @@ function summarizeEntries(entries) {
   );
 }
 
+function CardioStat({ label, value, sub }) {
+  return (
+    <div className="rounded-2xl bg-white/75 p-3">
+      <div className="text-xs font-medium text-sky-700">{label}</div>
+      <div className="mt-1 text-2xl font-bold text-sky-950">{value}</div>
+      {sub && <div className="text-xs text-sky-700">{sub}</div>}
+    </div>
+  );
+}
+
+function ProgressBar({ value, max, label, rightLabel }) {
+  const width = Math.min(100, Math.round((toNumber(value) / Math.max(toNumber(max), 1)) * 100));
+  return (
+    <div className="grid grid-cols-[84px_1fr_88px] items-center gap-2 text-xs">
+      <div className="font-medium text-zinc-600">{label}</div>
+      <div className="h-3 overflow-hidden rounded-full bg-zinc-100">
+        <div className="h-full rounded-full bg-sky-600" style={{ width: `${width}%` }} />
+      </div>
+      <div className="text-right text-zinc-600">{rightLabel}</div>
+    </div>
+  );
+}
+
+function CardioLineChart({ points, valueKey = "avgHr", label = "Avg HR" }) {
+  const valid = (points ?? [])
+    .map((point) => ({ ...point, value: toNumber(point[valueKey]) }))
+    .filter((point) => point.value > 0);
+
+  if (valid.length < 2) {
+    return <div className="rounded-xl bg-zinc-50 p-4 text-sm text-zinc-500">Need at least two synced workouts with {label.toLowerCase()} to show a trend.</div>;
+  }
+
+  const minValue = Math.min(...valid.map((point) => point.value));
+  const maxValue = Math.max(...valid.map((point) => point.value));
+  const range = Math.max(maxValue - minValue, 1);
+  const coords = valid.map((point, index) => {
+    const x = valid.length === 1 ? 50 : (index / (valid.length - 1)) * 100;
+    const y = 90 - ((point.value - minValue) / range) * 75;
+    return { ...point, x, y };
+  });
+  const polyline = coords.map((point) => `${point.x},${point.y}`).join(" ");
+
+  return (
+    <div className="rounded-2xl bg-white p-4">
+      <div className="mb-2 flex items-center justify-between text-sm">
+        <span className="font-semibold text-zinc-800">{label} trend</span>
+        <span className="text-xs text-zinc-500">{roundOne(minValue)}–{roundOne(maxValue)}</span>
+      </div>
+      <svg viewBox="0 0 100 100" className="h-44 w-full overflow-visible">
+        <polyline points={polyline} fill="none" stroke="currentColor" strokeWidth="2.5" className="text-sky-700" />
+        {coords.map((point, index) => (
+          <g key={`${point.date}-${index}`}>
+            <circle cx={point.x} cy={point.y} r="2.8" className="fill-sky-700" />
+            <text x={point.x} y={Math.max(8, point.y - 6)} textAnchor="middle" className="fill-zinc-500 text-[5px]">{roundOne(point.value)}</text>
+          </g>
+        ))}
+      </svg>
+      <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-zinc-500 md:grid-cols-4">
+        {coords.slice(-4).map((point, index) => (
+          <div key={`${point.date}-${index}`} className="rounded-lg bg-zinc-50 px-2 py-1">
+            <div className="font-medium text-zinc-700">{displayDate(point.date)}</div>
+            <div>{point.type || "Workout"} · {roundOne(point.value)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function CardioTracker({ state, activeDate, updateNested, updateState }) {
   const [selectedDate, setSelectedDate] = useState(activeDate || dateKey(new Date()));
   const [importSummary, setImportSummary] = useState("");
@@ -578,6 +647,65 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
   }, [cardioLog, selectedDate]);
 
   const maxMinutes = Math.max(...recentWeeks.map((week) => week.minutes), Number(goals.weeklyMinutes) || 1, 1);
+
+  const cardioAnalytics = useMemo(() => {
+    const entries = Object.entries(cardioLog)
+      .map(([date, item]) => ({ date, ...(item ?? {}) }))
+      .filter((item) => item.completed || toNumber(item.duration) || toNumber(item.distance) || toNumber(item.calories) || item.healthWorkouts?.length)
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    const syncedWorkouts = allHealthWorkoutOptions
+      .map((option) => ({ date: option.date, ...(option.workout ?? {}) }))
+      .sort((a, b) => {
+        const aTime = a.startTime ? new Date(a.startTime).getTime() : new Date(a.date).getTime();
+        const bTime = b.startTime ? new Date(b.startTime).getTime() : new Date(b.date).getTime();
+        return aTime - bTime;
+      });
+
+    const total = summarizeEntries(entries);
+    const avgHrValues = syncedWorkouts.map((workout) => toNumber(workout.avgHr)).filter(Boolean);
+    const avgHr = avgHrValues.length ? roundOne(avgHrValues.reduce((sum, value) => sum + value, 0) / avgHrValues.length) : "";
+    const workoutsWithHr = syncedWorkouts.filter((workout) => toNumber(workout.avgHr) || workout.hrSummary?.sampleCount).length;
+    const workoutsWithDistance = syncedWorkouts.filter((workout) => toNumber(workout.distance)).length;
+    const workoutsWithCalories = syncedWorkouts.filter((workout) => toNumber(workout.calories)).length;
+
+    const typeTotals = {};
+    syncedWorkouts.forEach((workout) => {
+      const type = workout.type || workout.sourceType || "Other";
+      if (!typeTotals[type]) typeTotals[type] = { type, sessions: 0, minutes: 0, distance: 0, calories: 0 };
+      typeTotals[type].sessions += 1;
+      typeTotals[type].minutes += toNumber(workout.duration);
+      typeTotals[type].distance += toNumber(workout.distance);
+      typeTotals[type].calories += toNumber(workout.calories);
+    });
+
+    const typeBreakdown = Object.values(typeTotals).sort((a, b) => b.minutes - a.minutes).slice(0, 6);
+    const hrTrend = syncedWorkouts
+      .filter((workout) => toNumber(workout.avgHr))
+      .slice(-12)
+      .map((workout) => ({
+        date: workout.date || dateFromDateTime(workout.startTime),
+        avgHr: workout.avgHr,
+        type: workout.type || workout.sourceType || "Workout"
+      }));
+
+    const bestWeek = recentWeeks.reduce((best, week) => week.minutes > (best?.minutes ?? -1) ? week : best, null);
+
+    return {
+      entries,
+      syncedWorkouts,
+      total,
+      avgHr,
+      workoutsWithHr,
+      workoutsWithDistance,
+      workoutsWithCalories,
+      typeBreakdown,
+      hrTrend,
+      bestWeek
+    };
+  }, [cardioLog, allHealthWorkoutOptions, recentWeeks]);
+
+  const weeklyGoalPercent = Math.min(100, Math.round((selectedWeekSummary.minutes / Math.max(Number(goals.weeklyMinutes) || 1, 1)) * 100));
 
   function updateCardioEntry(patch) {
     updateNested("cardioLog", selectedDate, { ...entry, ...patch });
@@ -895,86 +1023,11 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
       <summary className="cursor-pointer select-none text-lg font-semibold text-sky-900">Cardio Tracker</summary>
       <div className="mt-4 space-y-4">
         <div className="grid gap-3 md:grid-cols-4">
-          <div className="rounded-2xl bg-white/70 p-3">
-            <div className="text-xs font-medium text-sky-700">This week</div>
-            <div className="mt-1 text-2xl font-bold">{selectedWeekSummary.minutes}</div>
-            <div className="text-xs text-sky-700">minutes</div>
-          </div>
-          <div className="rounded-2xl bg-white/70 p-3">
-            <div className="text-xs font-medium text-sky-700">Sessions</div>
-            <div className="mt-1 text-2xl font-bold">{selectedWeekSummary.sessions}/{goals.weeklySessions || 0}</div>
-            <div className="text-xs text-sky-700">weekly goal</div>
-          </div>
-          <div className="rounded-2xl bg-white/70 p-3">
-            <div className="text-xs font-medium text-sky-700">Distance</div>
-            <div className="mt-1 text-2xl font-bold">{roundOne(selectedWeekSummary.distance)}</div>
-            <div className="text-xs text-sky-700">miles / km</div>
-          </div>
-          <div className="rounded-2xl bg-white/70 p-3">
-            <div className="text-xs font-medium text-sky-700">Calories</div>
-            <div className="mt-1 text-2xl font-bold">{Math.round(selectedWeekSummary.calories)}</div>
-            <div className="text-xs text-sky-700">estimated</div>
-          </div>
+          <CardioStat label="This week" value={roundOne(selectedWeekSummary.minutes)} sub={`${weeklyGoalPercent}% of ${goals.weeklyMinutes || 0} min goal`} />
+          <CardioStat label="Sessions" value={`${selectedWeekSummary.sessions}/${goals.weeklySessions || 0}`} sub="weekly goal" />
+          <CardioStat label="Synced workouts" value={cardioAnalytics.syncedWorkouts.length} sub={`${cardioAnalytics.workoutsWithHr} with HR`} />
+          <CardioStat label="Avg HR" value={cardioAnalytics.avgHr || "—"} sub="synced workouts" />
         </div>
-
-        <div className="rounded-2xl border border-sky-100 bg-white p-4">
-          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-            <div>
-              <h3 className="text-sm font-semibold text-zinc-900">Apple Health / Health Auto Export import</h3>
-              <p className="mt-1 max-w-3xl text-xs leading-5 text-zinc-600">
-                Export workout data from Health Auto Export as CSV or JSON, then import it here. The importer looks for workout start/end times and timestamped heart-rate samples, so it can attach HR data to the specific workout window when those fields are present.
-              </p>
-              {importSummary && <p className="mt-2 rounded-xl bg-sky-50 px-3 py-2 text-xs text-sky-800">{importSummary}</p>}
-              {syncSummary && <p className="mt-2 rounded-xl bg-emerald-50 px-3 py-2 text-xs text-emerald-800">{syncSummary}</p>}
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={syncAppleHealth} disabled={syncingHealth}>{syncingHealth ? "Syncing..." : "Sync Apple Health"}</Button>
-              <Button variant="outline" onClick={syncSelectedCardioDate} disabled={syncingHealth}>Sync selected date</Button>
-              <Button variant="outline" onClick={clearLocalSyncedHealthWorkouts}>Clear local sync</Button>
-              <Button variant="outline" onClick={forgetHealthSyncSecret}>Forget Sync Secret</Button>
-              <Button variant="outline" onClick={() => fileInputRef.current?.click()}>Import Apple Health CSV/JSON</Button>
-              <input ref={fileInputRef} type="file" accept=".csv,.json,text/csv,application/json" onChange={handleHealthImport} className="hidden" />
-            </div>
-          </div>
-        </div>
-
-        {!!allHealthWorkoutOptions.length && (
-          <div className="rounded-2xl border border-emerald-100 bg-white p-4">
-            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-              <div>
-                <h3 className="text-sm font-semibold text-zinc-900">Imported Apple Health Workouts</h3>
-                <p className="mt-1 text-xs text-zinc-600">Select a synced workout to edit it, save corrections back to Supabase, or delete a bad import.</p>
-              </div>
-              <div className="text-xs text-zinc-500">{allHealthWorkoutOptions.length} synced workout{allHealthWorkoutOptions.length === 1 ? "" : "s"}</div>
-            </div>
-            <div className="mt-3 max-h-64 space-y-2 overflow-auto pr-1">
-              {allHealthWorkoutOptions.map(({ date, workout, key }) => {
-                const selected = key === selectedHealthWorkoutOption?.key;
-                return (
-                  <button
-                    key={key}
-                    onClick={() => {
-                      setSelectedHealthWorkoutId(key);
-                      setSelectedDate(date);
-                    }}
-                    className={`w-full rounded-xl border px-3 py-2 text-left text-sm ${selected ? "border-emerald-300 bg-emerald-50" : "border-zinc-200 bg-zinc-50 hover:bg-zinc-100"}`}
-                  >
-                    <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-                      <div className="font-semibold text-zinc-900">{displayDate(date)} · {workout.sourceType || workout.type || "Workout"}</div>
-                      <div className="text-xs text-zinc-500">
-                        {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "No start"}
-                        {workout.endTime ? ` – ${new Date(workout.endTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}
-                      </div>
-                    </div>
-                    <div className="mt-1 text-xs text-zinc-600">
-                      {workout.duration || "—"} min · {workout.distance || "—"} distance · {workout.calories || "—"} cal · Avg HR {workout.avgHr || "—"}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        )}
 
         <div className="rounded-2xl bg-white p-4">
           <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]">
@@ -1023,87 +1076,195 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
           </div>
 
           <textarea value={entry.notes ?? ""} onChange={(e) => updateCardioEntry({ notes: e.target.value })} placeholder="Cardio notes: pace, incline, machine, recovery, breathing, etc." className="mt-3 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" rows={2} />
+        </div>
 
-          {!!allHealthWorkoutOptions.length && (
-            <div className="mt-4 rounded-2xl border border-emerald-100 bg-emerald-50 p-3">
-              <div className="text-sm font-semibold text-emerald-900">Edit imported cardio workout</div>
-              <p className="mt-1 text-xs text-emerald-800">
-                Select any synced/imported workout, even if it is not on the currently selected cardio date. Choosing a workout will keep the editor visible and update the cardio date when you edit it.
+        <details className="rounded-2xl border border-sky-100 bg-white p-4">
+          <summary className="cursor-pointer select-none text-sm font-semibold text-zinc-900">Apple Health sync and import tools</summary>
+          <div className="mt-3 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <p className="max-w-3xl text-xs leading-5 text-zinc-600">
+                Use these only when you need to pull new Apple Health data, re-sync one date, clear the local cache, or manually import a Health Auto Export CSV/JSON file.
               </p>
-              <div className="mt-3 grid gap-3 md:grid-cols-[2fr_1fr_auto]">
-                <label className="text-sm font-medium text-zinc-700">
-                  Imported workout
-                  <select
-                    value={selectedHealthWorkoutOption?.key ?? ""}
-                    onChange={(e) => {
-                      const option = allHealthWorkoutOptions.find((item) => item.key === e.target.value);
-                      setSelectedHealthWorkoutId(e.target.value);
-                      if (option?.date) setSelectedDate(option.date);
-                    }}
-                    className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm"
-                  >
-                    {allHealthWorkoutOptions.map(({ date, workout, index, key }) => (
-                      <option key={key} value={key}>
-                        {displayDate(date)} · {workout.sourceType || workout.type || "Workout"} · {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : `#${index + 1}`} · {workout.duration || "—"} min
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div className="rounded-xl bg-white px-3 py-2 text-xs text-zinc-600">
-                  <div className="font-semibold text-zinc-800">Selected workout day total</div>
-                  {selectedHealthWorkoutDailyTotal.duration || "0"} min · {selectedHealthWorkoutDailyTotal.calories || "0"} cal · Avg HR {selectedHealthWorkoutDailyTotal.avgHr || "—"}
+              {importSummary && <p className="mt-2 rounded-xl bg-sky-50 px-3 py-2 text-xs text-sky-800">{importSummary}</p>}
+              {syncSummary && <p className="mt-2 rounded-xl bg-emerald-50 px-3 py-2 text-xs text-emerald-800">{syncSummary}</p>}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={syncAppleHealth} disabled={syncingHealth}>{syncingHealth ? "Syncing..." : "Sync Apple Health"}</Button>
+              <Button variant="outline" onClick={syncSelectedCardioDate} disabled={syncingHealth}>Sync selected date</Button>
+              <Button variant="outline" onClick={clearLocalSyncedHealthWorkouts}>Clear local sync</Button>
+              <Button variant="outline" onClick={forgetHealthSyncSecret}>Forget Sync Secret</Button>
+              <Button variant="outline" onClick={() => fileInputRef.current?.click()}>Import CSV/JSON</Button>
+              <input ref={fileInputRef} type="file" accept=".csv,.json,text/csv,application/json" onChange={handleHealthImport} className="hidden" />
+            </div>
+          </div>
+        </details>
+
+        {!!allHealthWorkoutOptions.length && (
+          <details className="rounded-2xl border border-emerald-100 bg-white p-4">
+            <summary className="cursor-pointer select-none text-sm font-semibold text-zinc-900">Imported workout manager</summary>
+            <div className="mt-3 grid gap-4 lg:grid-cols-[1fr_1.4fr]">
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Imported Apple Health workouts</div>
+                  <div className="text-xs text-zinc-500">{allHealthWorkoutOptions.length} synced</div>
                 </div>
-                <div className="flex flex-wrap gap-2 md:mt-5">
-                  <Button onClick={saveSelectedHealthWorkoutToSupabase} disabled={savingRemoteHealth}>{savingRemoteHealth ? "Saving..." : "Save to Supabase"}</Button>
-                  <Button variant="outline" onClick={deleteSelectedHealthWorkout}>Remove locally</Button>
-                  <Button variant="outline" onClick={deleteSelectedHealthWorkoutFromSupabase} disabled={savingRemoteHealth}>Delete from Supabase</Button>
+                <div className="max-h-80 space-y-2 overflow-auto pr-1">
+                  {allHealthWorkoutOptions.map(({ date, workout, key }) => {
+                    const selected = key === selectedHealthWorkoutOption?.key;
+                    return (
+                      <button
+                        key={key}
+                        onClick={() => {
+                          setSelectedHealthWorkoutId(key);
+                          setSelectedDate(date);
+                        }}
+                        className={`w-full rounded-xl border px-3 py-2 text-left text-sm ${selected ? "border-emerald-300 bg-emerald-50" : "border-zinc-200 bg-zinc-50 hover:bg-zinc-100"}`}
+                      >
+                        <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                          <div className="font-semibold text-zinc-900">{displayDate(date)} · {workout.sourceType || workout.type || "Workout"}</div>
+                          <div className="text-xs text-zinc-500">
+                            {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "No start"}
+                            {workout.endTime ? ` – ${new Date(workout.endTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}
+                          </div>
+                        </div>
+                        <div className="mt-1 text-xs text-zinc-600">
+                          {workout.duration || "—"} min · {workout.distance || "—"} distance · {workout.calories || "—"} cal · Avg HR {workout.avgHr || "—"}
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
-              {selectedHealthWorkout && (
-                <div className="mt-3 grid gap-3 md:grid-cols-4">
+              <div className="rounded-2xl border border-emerald-100 bg-emerald-50 p-3">
+                <div className="text-sm font-semibold text-emerald-900">Edit selected imported workout</div>
+                <p className="mt-1 text-xs text-emerald-800">
+                  Corrections can stay local or be saved back to Supabase so future syncs keep the fixed values.
+                </p>
+
+                <div className="mt-3 grid gap-3 md:grid-cols-[2fr_1fr]">
                   <label className="text-sm font-medium text-zinc-700">
-                    Type
-                    <select value={selectedHealthWorkout.type ?? "Other"} onChange={(e) => updateSelectedHealthWorkout({ type: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm">
-                      {CARDIO_TYPES.map((type) => <option key={type}>{type}</option>)}
+                    Imported workout
+                    <select
+                      value={selectedHealthWorkoutOption?.key ?? ""}
+                      onChange={(e) => {
+                        const option = allHealthWorkoutOptions.find((item) => item.key === e.target.value);
+                        setSelectedHealthWorkoutId(e.target.value);
+                        if (option?.date) setSelectedDate(option.date);
+                      }}
+                      className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm"
+                    >
+                      {allHealthWorkoutOptions.map(({ date, workout, index, key }) => (
+                        <option key={key} value={key}>
+                          {displayDate(date)} · {workout.sourceType || workout.type || "Workout"} · {workout.startTime ? new Date(workout.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : `#${index + 1}`} · {workout.duration || "—"} min
+                        </option>
+                      ))}
                     </select>
                   </label>
-                  <label className="text-sm font-medium text-zinc-700">
-                    Source label
-                    <input value={selectedHealthWorkout.sourceType ?? ""} onChange={(e) => updateSelectedHealthWorkout({ sourceType: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
-                  </label>
-                  <label className="text-sm font-medium text-zinc-700">
-                    Start time
-                    <input type="datetime-local" value={formatDateTimeLocal(selectedHealthWorkout.startTime)} onChange={(e) => updateSelectedHealthWorkout({ startTime: dateTimeLocalToIso(e.target.value) })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
-                  </label>
-                  <label className="text-sm font-medium text-zinc-700">
-                    End time
-                    <input type="datetime-local" value={formatDateTimeLocal(selectedHealthWorkout.endTime)} onChange={(e) => updateSelectedHealthWorkout({ endTime: dateTimeLocalToIso(e.target.value) })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
-                  </label>
-                  <label className="text-sm font-medium text-zinc-700">
-                    Duration minutes
-                    <input value={selectedHealthWorkout.duration ?? ""} onChange={(e) => updateSelectedHealthWorkout({ duration: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
-                  </label>
-                  <label className="text-sm font-medium text-zinc-700">
-                    Distance
-                    <input value={selectedHealthWorkout.distance ?? ""} onChange={(e) => updateSelectedHealthWorkout({ distance: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
-                  </label>
-                  <label className="text-sm font-medium text-zinc-700">
-                    Calories
-                    <input value={selectedHealthWorkout.calories ?? ""} onChange={(e) => updateSelectedHealthWorkout({ calories: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
-                  </label>
-                  <label className="text-sm font-medium text-zinc-700">
-                    Avg HR
-                    <input value={selectedHealthWorkout.avgHr ?? ""} onChange={(e) => updateSelectedHealthWorkout({ avgHr: e.target.value, hrSummary: { ...(selectedHealthWorkout.hrSummary ?? {}), avgHr: e.target.value } })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
-                  </label>
+                  <div className="rounded-xl bg-white px-3 py-2 text-xs text-zinc-600">
+                    <div className="font-semibold text-zinc-800">Selected day total</div>
+                    {selectedHealthWorkoutDailyTotal.duration || "0"} min · {selectedHealthWorkoutDailyTotal.calories || "0"} cal · Avg HR {selectedHealthWorkoutDailyTotal.avgHr || "—"}
+                  </div>
                 </div>
+
+                {selectedHealthWorkout && (
+                  <div className="mt-3 grid gap-3 md:grid-cols-4">
+                    <label className="text-sm font-medium text-zinc-700">
+                      Type
+                      <select value={selectedHealthWorkout.type ?? "Other"} onChange={(e) => updateSelectedHealthWorkout({ type: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm">
+                        {CARDIO_TYPES.map((type) => <option key={type}>{type}</option>)}
+                      </select>
+                    </label>
+                    <label className="text-sm font-medium text-zinc-700">
+                      Source label
+                      <input value={selectedHealthWorkout.sourceType ?? ""} onChange={(e) => updateSelectedHealthWorkout({ sourceType: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                    </label>
+                    <label className="text-sm font-medium text-zinc-700">
+                      Start time
+                      <input type="datetime-local" value={formatDateTimeLocal(selectedHealthWorkout.startTime)} onChange={(e) => updateSelectedHealthWorkout({ startTime: dateTimeLocalToIso(e.target.value) })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                    </label>
+                    <label className="text-sm font-medium text-zinc-700">
+                      End time
+                      <input type="datetime-local" value={formatDateTimeLocal(selectedHealthWorkout.endTime)} onChange={(e) => updateSelectedHealthWorkout({ endTime: dateTimeLocalToIso(e.target.value) })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                    </label>
+                    <label className="text-sm font-medium text-zinc-700">
+                      Duration minutes
+                      <input value={selectedHealthWorkout.duration ?? ""} onChange={(e) => updateSelectedHealthWorkout({ duration: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                    </label>
+                    <label className="text-sm font-medium text-zinc-700">
+                      Distance
+                      <input value={selectedHealthWorkout.distance ?? ""} onChange={(e) => updateSelectedHealthWorkout({ distance: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                    </label>
+                    <label className="text-sm font-medium text-zinc-700">
+                      Calories
+                      <input value={selectedHealthWorkout.calories ?? ""} onChange={(e) => updateSelectedHealthWorkout({ calories: e.target.value })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                    </label>
+                    <label className="text-sm font-medium text-zinc-700">
+                      Avg HR
+                      <input value={selectedHealthWorkout.avgHr ?? ""} onChange={(e) => updateSelectedHealthWorkout({ avgHr: e.target.value, hrSummary: { ...(selectedHealthWorkout.hrSummary ?? {}), avgHr: e.target.value } })} className="mt-1 w-full rounded-xl border border-zinc-200 px-3 py-2 text-sm" />
+                    </label>
+                    <div className="flex flex-wrap gap-2 md:col-span-4">
+                      <Button onClick={saveSelectedHealthWorkoutToSupabase} disabled={savingRemoteHealth}>{savingRemoteHealth ? "Saving..." : "Save to Supabase"}</Button>
+                      <Button variant="outline" onClick={deleteSelectedHealthWorkout}>Remove locally</Button>
+                      <Button variant="outline" onClick={deleteSelectedHealthWorkoutFromSupabase} disabled={savingRemoteHealth}>Delete from Supabase</Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </details>
+        )}
+
+        <details className="rounded-2xl border border-sky-100 bg-white p-4" open>
+          <summary className="cursor-pointer select-none text-sm font-semibold text-zinc-900">Cardio analytics</summary>
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            <div className="rounded-2xl bg-white p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <div className="text-sm font-semibold text-zinc-800">Recent weekly cardio minutes</div>
+                <div className="text-xs text-zinc-500">Best: {cardioAnalytics.bestWeek ? `${cardioAnalytics.bestWeek.minutes} min` : "—"}</div>
+              </div>
+              <div className="space-y-2">
+                {recentWeeks.map((week) => (
+                  <ProgressBar key={week.label} value={week.minutes} max={maxMinutes} label={week.label} rightLabel={`${roundOne(week.minutes)} min`} />
+                ))}
+              </div>
+            </div>
+
+            <CardioLineChart points={cardioAnalytics.hrTrend} valueKey="avgHr" label="Average heart rate" />
+
+            <div className="rounded-2xl bg-white p-4">
+              <div className="mb-3 text-sm font-semibold text-zinc-800">Workout type volume</div>
+              {cardioAnalytics.typeBreakdown.length ? (
+                <div className="space-y-2">
+                  {cardioAnalytics.typeBreakdown.map((item) => (
+                    <ProgressBar
+                      key={item.type}
+                      value={item.minutes}
+                      max={Math.max(...cardioAnalytics.typeBreakdown.map((type) => type.minutes), 1)}
+                      label={item.type}
+                      rightLabel={`${roundOne(item.minutes)} min`}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-xl bg-zinc-50 p-4 text-sm text-zinc-500">Sync or log cardio workouts to see type breakdown.</div>
               )}
             </div>
-          )}
+
+            <div className="rounded-2xl bg-white p-4">
+              <div className="mb-3 text-sm font-semibold text-zinc-800">Data completeness</div>
+              <div className="grid gap-2 text-sm md:grid-cols-2">
+                <div className="rounded-xl bg-zinc-50 p-3"><span className="block text-xs text-zinc-500">Total logged sessions</span><span className="font-semibold">{cardioAnalytics.total.sessions}</span></div>
+                <div className="rounded-xl bg-zinc-50 p-3"><span className="block text-xs text-zinc-500">Total minutes</span><span className="font-semibold">{roundOne(cardioAnalytics.total.minutes)}</span></div>
+                <div className="rounded-xl bg-zinc-50 p-3"><span className="block text-xs text-zinc-500">With distance</span><span className="font-semibold">{cardioAnalytics.workoutsWithDistance}/{cardioAnalytics.syncedWorkouts.length}</span></div>
+                <div className="rounded-xl bg-zinc-50 p-3"><span className="block text-xs text-zinc-500">With calories</span><span className="font-semibold">{cardioAnalytics.workoutsWithCalories}/{cardioAnalytics.syncedWorkouts.length}</span></div>
+              </div>
+            </div>
+          </div>
 
           {!!entry.healthWorkouts?.length && (
-            <div className="mt-4 rounded-2xl border border-sky-100 bg-sky-50 p-3">
-              <div className="text-sm font-semibold text-sky-900">Imported workout heart-rate details</div>
+            <details className="mt-4 rounded-2xl border border-sky-100 bg-sky-50 p-3">
+              <summary className="cursor-pointer select-none text-sm font-semibold text-sky-900">Selected date heart-rate details</summary>
               <div className="mt-3 space-y-3">
                 {entry.healthWorkouts.map((workout, index) => {
                   const summary = workout.hrSummary ?? {};
@@ -1137,28 +1298,9 @@ export default function CardioTracker({ state, activeDate, updateNested, updateS
                   );
                 })}
               </div>
-            </div>
+            </details>
           )}
-        </div>
-
-        <div className="rounded-2xl bg-white p-4">
-          <div className="mb-3 text-sm font-semibold text-zinc-800">Recent weekly cardio minutes</div>
-          <div className="space-y-2">
-            {recentWeeks.map((week) => {
-              const width = Math.min(100, Math.round((week.minutes / maxMinutes) * 100));
-              const goalMet = week.minutes >= Number(goals.weeklyMinutes || 0);
-              return (
-                <div key={week.label} className="grid grid-cols-[74px_1fr_88px] items-center gap-2 text-xs">
-                  <div className="font-medium text-zinc-600">{week.label}</div>
-                  <div className="h-3 overflow-hidden rounded-full bg-zinc-100">
-                    <div className={`h-full rounded-full ${goalMet ? "bg-sky-700" : "bg-sky-300"}`} style={{ width: `${width}%` }} />
-                  </div>
-                  <div className="text-right text-zinc-600">{week.minutes} min</div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+        </details>
       </div>
     </details>
   );
